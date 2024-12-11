@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 use bip300301::{jsonrpsee::http_client::HttpClientBuilder, MainClient as _};
-use bitcoin::{hashes::Hash, BlockHash};
 use clap::Parser;
 use jsonrpsee::server::ServerHandle;
 use tokio::time::Duration;
@@ -31,7 +30,7 @@ fn set_tracing_subscriber(log_level: tracing::Level) -> anyhow::Result<()> {
 }
 
 async fn spawn_rpc_server(
-    server: server::Server,
+    server: server::Server<DefaultEnforcer>,
     serve_rpc_addr: SocketAddr,
 ) -> anyhow::Result<ServerHandle> {
     use server::RpcServer;
@@ -90,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         sequence_stream,
     );
     let server =
-        server::Server::new(mempool, network_info, sample_block_template);
+        server::Server::new(mempool, network_info, sample_block_template)?;
     let rpc_server_handle =
         spawn_rpc_server(server, cli.serve_rpc_addr).await?;
     let () = rpc_server_handle.stopped().await;

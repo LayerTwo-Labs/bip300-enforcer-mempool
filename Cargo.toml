@@ -14,7 +14,7 @@ version = "0.1.0"
 
 [workspace.dependencies.bip300301]
 git = "https://github.com/Ash-L2L/bip300301.git"
-rev = "4ec0175093b072d4d0a523321b7bb35e3fc96ccf"
+rev = "1d6b5da3d346b13b49e42cdd7d91b86758e3b6d9"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

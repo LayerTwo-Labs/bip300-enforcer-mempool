@@ -20,7 +20,10 @@ use super::{
     batched_request, BatchedResponseItem, CombinedStreamItem, RequestError,
     RequestItem, RequestQueue, ResponseItem,
 };
-use crate::zmq::{SequenceMessage, SequenceStream, SequenceStreamError};
+use crate::zmq::{
+    BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
+    SequenceStreamError, TxHashEvent, TxHashMessage,
+};
 
 #[derive(Debug)]
 struct MempoolSyncing {
@@ -67,85 +70,81 @@ pub enum SyncMempoolError {
     SequenceStreamEnded,
 }
 
-fn handle_seq_message(
+fn handle_block_hash_msg(
     sync_state: &mut MempoolSyncing,
-    seq_msg: SequenceMessage,
-) -> Result<(), SyncMempoolError> {
-    match seq_msg {
-        SequenceMessage::BlockHashConnected(block_hash, _) => {
-            // FIXME: remove
-            tracing::debug!("Adding block {block_hash} to req queue");
+    block_hash_msg: BlockHashMessage,
+) {
+    let BlockHashMessage {
+        block_hash, event, ..
+    } = block_hash_msg;
+    tracing::trace!(%block_hash, "Adding block to req queue");
+    match event {
+        BlockHashEvent::Disconnected
+            if sync_state.mempool.chain.blocks.contains_key(&block_hash) => {}
+        BlockHashEvent::Connected | BlockHashEvent::Disconnected => {
             sync_state.blocks_needed.replace(block_hash);
             sync_state
                 .request_queue
                 .push_back(RequestItem::Block(block_hash));
         }
-        SequenceMessage::BlockHashDisconnected(block_hash, _) => {
-            // FIXME: remove
-            tracing::debug!("Adding block {block_hash} to req queue");
-            if !sync_state.mempool.chain.blocks.contains_key(&block_hash) {
-                sync_state.blocks_needed.replace(block_hash);
-                sync_state
-                    .request_queue
-                    .push_back(RequestItem::Block(block_hash));
+    }
+}
+
+fn handle_tx_hash_msg(
+    sync_state: &mut MempoolSyncing,
+    tx_hash_msg: TxHashMessage,
+) -> Result<(), SyncMempoolError> {
+    let TxHashMessage {
+        txid,
+        event,
+        mempool_seq,
+        zmq_seq: _,
+    } = tx_hash_msg;
+    if let Some(first_mempool_seq) = sync_state.first_mempool_sequence {
+        match mempool_seq.cmp(&first_mempool_seq) {
+            Ordering::Less => {
+                // Ignore
+                return Ok(());
+            }
+            Ordering::Equal => {
+                sync_state.first_mempool_sequence = None;
+            }
+            Ordering::Greater => {
+                return Err(SyncMempoolError::FirstMempoolSequence(
+                    first_mempool_seq,
+                ))
             }
         }
-        SequenceMessage::TxHashAdded {
-            txid,
-            mempool_seq,
-            zmq_seq: _,
-        } => {
-            if let Some(first_mempool_seq) = sync_state.first_mempool_sequence {
-                match mempool_seq.cmp(&first_mempool_seq) {
-                    Ordering::Less => {
-                        // Ignore
-                        return Ok(());
-                    }
-                    Ordering::Equal => {
-                        sync_state.first_mempool_sequence = None;
-                    }
-                    Ordering::Greater => {
-                        return Err(SyncMempoolError::FirstMempoolSequence(
-                            first_mempool_seq,
-                        ))
-                    }
-                }
-            }
-            // FIXME: remove
-            tracing::debug!("Added {txid} to req queue");
+    }
+    match event {
+        TxHashEvent::Added => {
+            tracing::trace!(%txid, "Added tx to req queue");
             sync_state.txs_needed.replace(txid);
             sync_state
                 .request_queue
                 .push_back(RequestItem::Tx(txid, true));
         }
-        SequenceMessage::TxHashRemoved {
-            txid,
-            mempool_seq,
-            zmq_seq: _,
-        } => {
-            if let Some(first_mempool_sequence) =
-                sync_state.first_mempool_sequence
-            {
-                match mempool_seq.cmp(&first_mempool_sequence) {
-                    Ordering::Less => {
-                        // Ignore
-                        return Ok(());
-                    }
-                    Ordering::Equal => {
-                        sync_state.first_mempool_sequence = None;
-                    }
-                    Ordering::Greater => {
-                        return Err(SyncMempoolError::FirstMempoolSequence(
-                            first_mempool_sequence,
-                        ))
-                    }
-                }
-            }
-            tracing::debug!("Remove tx {txid} from req queue");
+        TxHashEvent::Removed => {
+            tracing::trace!(%txid, "Removed tx from req queue");
             sync_state.txs_needed.remove(&txid);
             sync_state
                 .request_queue
                 .remove(&RequestItem::Tx(txid, true));
+        }
+    }
+    Ok(())
+}
+
+fn handle_seq_message(
+    sync_state: &mut MempoolSyncing,
+    seq_msg: SequenceMessage,
+) -> Result<(), SyncMempoolError> {
+    match seq_msg {
+        SequenceMessage::BlockHash(block_hash_msg) => {
+            let () = handle_block_hash_msg(sync_state, block_hash_msg);
+        }
+        SequenceMessage::TxHash(tx_hash_msg) => {
+            let () = handle_tx_hash_msg(sync_state, tx_hash_msg)?;
         }
     }
     sync_state.seq_message_queue.push_back(seq_msg);
@@ -158,9 +157,11 @@ fn handle_resp_block(
 ) -> Result<(), MempoolRemoveError> {
     sync_state.blocks_needed.remove(&block.hash);
     match sync_state.seq_message_queue.front() {
-        Some(SequenceMessage::BlockHashConnected(block_hash, _))
-            if *block_hash == block.hash =>
-        {
+        Some(SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash,
+            event: BlockHashEvent::Connected,
+            ..
+        })) if *block_hash == block.hash => {
             for txid in &block.tx {
                 let _removed: Option<_> = sync_state.mempool.remove(txid)?;
                 sync_state.txs_needed.remove(txid);
@@ -171,9 +172,12 @@ fn handle_resp_block(
             sync_state.mempool.chain.tip = block.hash;
             sync_state.seq_message_queue.pop_front();
         }
-        Some(SequenceMessage::BlockHashDisconnected(block_hash, _))
-            if *block_hash == block.hash
-                && sync_state.mempool.chain.tip == block.hash =>
+        Some(SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash,
+            event: BlockHashEvent::Disconnected,
+            ..
+        })) if *block_hash == block.hash
+            && sync_state.mempool.chain.tip == block.hash =>
         {
             for _txid in &block.tx {
                 // FIXME: insert without info
@@ -252,7 +256,11 @@ fn try_apply_next_seq_message(
 ) -> Result<bool, SyncMempoolError> {
     let res = 'res: {
         match sync_state.seq_message_queue.front() {
-            Some(SequenceMessage::BlockHashDisconnected(block_hash, _)) => {
+            Some(SequenceMessage::BlockHash(BlockHashMessage {
+                block_hash,
+                event: BlockHashEvent::Disconnected,
+                ..
+            })) => {
                 if sync_state.mempool.chain.tip != *block_hash {
                     break 'res false;
                 };
@@ -270,23 +278,25 @@ fn try_apply_next_seq_message(
                     .unwrap_or_else(BlockHash::all_zeros);
                 true
             }
-            Some(SequenceMessage::TxHashAdded {
+            Some(SequenceMessage::TxHash(TxHashMessage {
                 txid,
+                event: TxHashEvent::Added,
                 mempool_seq: _,
                 zmq_seq: _,
-            }) => {
+            })) => {
                 let txid = *txid;
                 try_add_tx_from_cache(sync_state, &txid)?
             }
-            Some(SequenceMessage::TxHashRemoved {
+            Some(SequenceMessage::TxHash(TxHashMessage {
                 txid,
+                event: TxHashEvent::Removed,
                 mempool_seq: _,
                 zmq_seq: _,
-            }) => {
+            })) => {
                 // FIXME: review -- looks sus
                 sync_state.mempool.remove(txid)?.is_some()
             }
-            Some(SequenceMessage::BlockHashConnected(_, _)) | None => false,
+            Some(SequenceMessage::BlockHash(_)) | None => false,
         }
     };
     if res {
@@ -375,11 +385,12 @@ pub async fn init_sync_mempool(
             request_queue.push_back(RequestItem::Tx(*txid, true));
         }
         let seq_message_queue = VecDeque::from_iter(txids.iter().map(|txid| {
-            SequenceMessage::TxHashAdded {
+            SequenceMessage::TxHash(TxHashMessage {
                 txid: *txid,
+                event: TxHashEvent::Added,
                 mempool_seq: mempool_sequence,
                 zmq_seq: 0,
-            }
+            })
         }));
         MempoolSyncing {
             blocks_needed: LinkedHashSet::from_iter([prev_blockhash]),

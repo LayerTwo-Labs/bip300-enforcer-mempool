@@ -19,9 +19,12 @@ use super::{
     RequestError, RequestQueue, ResponseItem,
 };
 use crate::{
-    cusf_enforcer::CusfEnforcer,
+    cusf_enforcer::{self, CusfEnforcer},
     mempool::{sync::RequestItem, MempoolInsertError, MempoolRemoveError},
-    zmq::{SequenceMessage, SequenceStream, SequenceStreamError},
+    zmq::{
+        BlockHashEvent, BlockHashMessage, SequenceMessage, SequenceStream,
+        SequenceStreamError, TxHashEvent, TxHashMessage,
+    },
 };
 
 #[derive(Debug)]
@@ -35,7 +38,7 @@ pub struct SyncState {
 }
 
 #[derive(Educe)]
-#[educe(Debug(bound(Enforcer::AcceptTxError: std::fmt::Debug)))]
+#[educe(Debug(bound(cusf_enforcer::Error<Enforcer>: std::fmt::Debug)))]
 #[derive(Error)]
 pub enum SyncTaskError<Enforcer>
 where
@@ -43,8 +46,8 @@ where
 {
     #[error("Combined stream ended unexpectedly")]
     CombinedStreamEnded,
-    #[error("CUSF enforcer error")]
-    CusfEnforcer(#[source] Enforcer::AcceptTxError),
+    #[error(transparent)]
+    CusfEnforcer(#[from] cusf_enforcer::Error<Enforcer>),
     #[error("Fee overflow")]
     FeeOverflow,
     #[error(transparent)]
@@ -57,44 +60,66 @@ where
     SequenceStream(#[from] SequenceStreamError),
 }
 
-async fn handle_seq_message(
-    mempool: &RwLock<Mempool>,
+struct MempoolSyncInner<Enforcer> {
+    enforcer: Enforcer,
+    mempool: Mempool,
+}
+
+async fn handle_seq_message<Enforcer>(
+    inner: &RwLock<MempoolSyncInner<Enforcer>>,
     sync_state: &mut SyncState,
     seq_msg: SequenceMessage,
 ) {
     match seq_msg {
-        SequenceMessage::BlockHashConnected(block_hash, _) => {
+        SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash,
+            event: BlockHashEvent::Connected,
+            ..
+        }) => {
             // FIXME: remove
             tracing::debug!("Adding block {block_hash} to req queue");
             sync_state
                 .request_queue
                 .push_back(RequestItem::Block(block_hash));
         }
-        SequenceMessage::BlockHashDisconnected(block_hash, _) => {
+        SequenceMessage::BlockHash(BlockHashMessage {
+            block_hash,
+            event: BlockHashEvent::Disconnected,
+            ..
+        }) => {
             // FIXME: remove
             tracing::debug!("Adding block {block_hash} to req queue");
-            if !mempool.read().await.chain.blocks.contains_key(&block_hash) {
+            if !inner
+                .read()
+                .await
+                .mempool
+                .chain
+                .blocks
+                .contains_key(&block_hash)
+            {
                 sync_state
                     .request_queue
                     .push_back(RequestItem::Block(block_hash));
             }
         }
-        SequenceMessage::TxHashAdded {
+        SequenceMessage::TxHash(TxHashMessage {
             txid,
+            event: TxHashEvent::Added,
             mempool_seq: _,
             zmq_seq: _,
-        } => {
+        }) => {
             // FIXME: remove
             tracing::debug!("Added {txid} to req queue");
             sync_state
                 .request_queue
                 .push_back(RequestItem::Tx(txid, true));
         }
-        SequenceMessage::TxHashRemoved {
+        SequenceMessage::TxHash(TxHashMessage {
             txid,
+            event: TxHashEvent::Removed,
             mempool_seq: _,
             zmq_seq: _,
-        } => {
+        }) => {
             tracing::debug!("Remove tx {txid} from req queue");
             sync_state
                 .request_queue
@@ -109,45 +134,66 @@ fn handle_resp_tx(sync_state: &mut SyncState, tx: Transaction) {
     sync_state.tx_cache.insert(txid, tx);
 }
 
-fn handle_resp_block(
-    mempool: &mut Mempool,
+async fn handle_resp_block<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
     block: bip300301::client::Block,
-) -> Result<(), MempoolRemoveError> {
-    match sync_state.seq_message_queue.front() {
-        Some(SequenceMessage::BlockHashConnected(block_hash, _))
-            if *block_hash == block.hash =>
-        {
+) -> Result<(), SyncTaskError<Enforcer>>
+where
+    Enforcer: CusfEnforcer,
+{
+    let block_parent =
+        block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
+    inner.mempool.chain.blocks.insert(block.hash, block.clone());
+    let Some(SequenceMessage::BlockHash(block_hash_msg)) =
+        sync_state.seq_message_queue.front()
+    else {
+        return Ok(());
+    };
+    match block_hash_msg.event {
+        BlockHashEvent::Connected => {
+            if block_hash_msg.block_hash != block.hash {
+                return Ok(());
+            }
             for txid in &block.tx {
-                let _removed: Option<_> = mempool.remove(txid)?;
+                let _removed: Option<_> = inner.mempool.remove(txid)?;
                 sync_state
                     .request_queue
                     .remove(&RequestItem::Tx(*txid, true));
             }
-            mempool.chain.tip = block.hash;
+            inner.mempool.chain.tip = block.hash;
+            let () = inner
+                .enforcer
+                .handle_block_hash_msg(*block_hash_msg)
+                .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
+                .await?;
             sync_state.seq_message_queue.pop_front();
         }
-        Some(SequenceMessage::BlockHashDisconnected(block_hash, _))
-            if *block_hash == block.hash && mempool.chain.tip == block.hash =>
-        {
+        BlockHashEvent::Disconnected => {
+            if !(block_hash_msg.block_hash == block.hash
+                && inner.mempool.chain.tip == block.hash)
+            {
+                return Ok(());
+            };
             for _txid in &block.tx {
                 // FIXME: insert without info
                 let () = todo!();
             }
-            mempool.chain.tip =
-                block.previousblockhash.unwrap_or_else(BlockHash::all_zeros);
+            inner.mempool.chain.tip = block_parent;
+            let () = inner
+                .enforcer
+                .handle_block_hash_msg(*block_hash_msg)
+                .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
+                .await?;
             sync_state.seq_message_queue.pop_front();
         }
-        Some(_) | None => (),
     }
-    mempool.chain.blocks.insert(block.hash, block);
     Ok(())
 }
 
 // returns `true` if the tx was added or rejected successfully
-fn try_add_tx_from_cache<Enforcer>(
-    enforcer: &mut Enforcer,
-    mempool: &mut Mempool,
+async fn try_add_tx_from_cache<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
     txid: &Txid,
 ) -> Result<bool, SyncTaskError<Enforcer>>
@@ -175,7 +221,8 @@ where
             return Ok(true);
         } else if let Some(input_tx) = sync_state.tx_cache.get(&input_txid) {
             input_tx
-        } else if let Some((input_tx, _)) = mempool.txs.0.get(&input_txid) {
+        } else if let Some((input_tx, _)) = inner.mempool.txs.0.get(&input_txid)
+        {
             input_tx
         } else {
             tracing::trace!("Need {input_txid} for {txid}");
@@ -198,11 +245,12 @@ where
     let Some(fee_delta) = value_in.checked_sub(value_out) else {
         return Err(SyncTaskError::FeeOverflow);
     };
-    if enforcer
+    if inner
+        .enforcer
         .accept_tx(tx, &input_txs)
-        .map_err(SyncTaskError::CusfEnforcer)?
+        .map_err(cusf_enforcer::Error::AcceptTx)?
     {
-        mempool.insert(tx.clone(), fee_delta.to_sat())?;
+        inner.mempool.insert(tx.clone(), fee_delta.to_sat())?;
         tracing::trace!("added {txid} to mempool");
     } else {
         tracing::trace!("rejecting {txid}");
@@ -211,15 +259,14 @@ where
             .request_queue
             .push_front(RequestItem::RejectTx(*txid));
     }
-    let mempool_txs = mempool.txs.0.len();
+    let mempool_txs = inner.mempool.txs.0.len();
     tracing::debug!(%mempool_txs, "Syncing...");
     Ok(true)
 }
 
 // returns `true` if an item was applied successfully
-fn try_apply_next_seq_message<Enforcer>(
-    enforcer: &mut Enforcer,
-    mempool: &mut Mempool,
+async fn try_apply_next_seq_message<Enforcer>(
+    inner: &mut MempoolSyncInner<Enforcer>,
     sync_state: &mut SyncState,
 ) -> Result<bool, SyncTaskError<Enforcer>>
 where
@@ -227,39 +274,57 @@ where
 {
     let res = 'res: {
         match sync_state.seq_message_queue.front() {
-            Some(SequenceMessage::BlockHashDisconnected(block_hash, _)) => {
-                if mempool.chain.tip != *block_hash {
+            Some(SequenceMessage::BlockHash(
+                block_hash_msg @ BlockHashMessage {
+                    block_hash,
+                    event: BlockHashEvent::Disconnected,
+                    ..
+                },
+            )) => {
+                if inner.mempool.chain.tip != *block_hash {
                     break 'res false;
                 };
-                let Some(block) = mempool.chain.blocks.get(block_hash) else {
+                let Some(block) = inner.mempool.chain.blocks.get(block_hash)
+                else {
                     break 'res false;
                 };
                 for _txid in &block.tx {
                     // FIXME: insert without info
                     let () = todo!();
                 }
-                mempool.chain.tip = block
+                let () = inner
+                    .enforcer
+                    .handle_block_hash_msg(*block_hash_msg)
+                    .map_err(cusf_enforcer::Error::HandleBlockHashMessage)
+                    .await?;
+                inner.mempool.chain.tip = block
                     .previousblockhash
                     .unwrap_or_else(BlockHash::all_zeros);
                 true
             }
-            Some(SequenceMessage::TxHashAdded {
+            Some(SequenceMessage::TxHash(TxHashMessage {
                 txid,
+                event: TxHashEvent::Added,
                 mempool_seq: _,
                 zmq_seq: _,
-            }) => {
+            })) => {
                 let txid = *txid;
-                try_add_tx_from_cache(enforcer, mempool, sync_state, &txid)?
+                try_add_tx_from_cache(inner, sync_state, &txid).await?
             }
-            Some(SequenceMessage::TxHashRemoved {
+            Some(SequenceMessage::TxHash(TxHashMessage {
                 txid,
+                event: TxHashEvent::Removed,
                 mempool_seq: _,
                 zmq_seq: _,
-            }) => {
+            })) => {
                 // FIXME: review -- looks sus
-                mempool.remove(txid)?.is_some()
+                inner.mempool.remove(txid)?.is_some()
             }
-            Some(SequenceMessage::BlockHashConnected(_, _)) | None => false,
+            Some(SequenceMessage::BlockHash(BlockHashMessage {
+                event: BlockHashEvent::Connected,
+                ..
+            }))
+            | None => false,
         }
     };
     if res {
@@ -269,15 +334,14 @@ where
 }
 
 async fn handle_resp<Enforcer>(
-    enforcer: &mut Enforcer,
-    mempool: &RwLock<Mempool>,
+    inner: &RwLock<MempoolSyncInner<Enforcer>>,
     sync_state: &mut SyncState,
     resp: BatchedResponseItem,
 ) -> Result<(), SyncTaskError<Enforcer>>
 where
     Enforcer: CusfEnforcer,
 {
-    let mut mempool_write = mempool.write().await;
+    let mut inner_write = inner.write().await;
     match resp {
         BatchedResponseItem::BatchTx(txs) => {
             let mut input_txs_needed = LinkedHashSet::new();
@@ -302,7 +366,8 @@ where
         BatchedResponseItem::Single(ResponseItem::Block(block)) => {
             // FIXME: remove
             tracing::debug!("Handling block {}", block.hash);
-            let () = handle_resp_block(&mut mempool_write, sync_state, *block)?;
+            let () =
+                handle_resp_block(&mut inner_write, sync_state, *block).await?;
         }
         BatchedResponseItem::Single(ResponseItem::Tx(tx, in_mempool)) => {
             let mut input_txs_needed = LinkedHashSet::new();
@@ -325,15 +390,12 @@ where
         BatchedResponseItem::BatchRejectTx
         | BatchedResponseItem::Single(ResponseItem::RejectTx) => {}
     }
-    while try_apply_next_seq_message(enforcer, &mut mempool_write, sync_state)?
-    {
-    }
+    while try_apply_next_seq_message(&mut inner_write, sync_state).await? {}
     Ok(())
 }
 
 async fn task<Enforcer>(
-    mut enforcer: Enforcer,
-    mempool: Arc<RwLock<Mempool>>,
+    inner: Arc<RwLock<MempoolSyncInner<Enforcer>>>,
     tx_cache: HashMap<Txid, Transaction>,
     rpc_client: HttpClient,
     sequence_stream: SequenceStream<'static>,
@@ -343,8 +405,12 @@ where
 {
     // Filter mempool with enforcer
     let rejected_txs: LinkedHashSet<Txid> = {
-        let mut mempool_write = mempool.write().await;
-        let rejected_txs = mempool_write
+        let mut inner_write = inner.write().await;
+        let MempoolSyncInner {
+            ref mut enforcer,
+            ref mut mempool,
+        } = *inner_write;
+        let rejected_txs = mempool
             .try_filter(|tx, mempool_inputs| {
                 let mut tx_inputs = mempool_inputs.clone();
                 for tx_in in &tx.input {
@@ -362,13 +428,14 @@ where
                     SyncTaskError::MempoolRemove(mempool_remove_err)
                 }
                 either::Either::Right(enforcer_err) => {
-                    SyncTaskError::CusfEnforcer(enforcer_err)
+                    let err = cusf_enforcer::Error::AcceptTx(enforcer_err);
+                    SyncTaskError::CusfEnforcer(err)
                 }
             })?
             .keys()
             .copied()
             .collect();
-        drop(mempool_write);
+        drop(inner_write);
         rejected_txs
     };
     let request_queue = RequestQueue::default();
@@ -401,65 +468,53 @@ where
         {
             CombinedStreamItem::ZmqSeq(seq_msg) => {
                 let () =
-                    handle_seq_message(&mempool, &mut sync_state, seq_msg?)
-                        .await;
+                    handle_seq_message(&inner, &mut sync_state, seq_msg?).await;
             }
             CombinedStreamItem::Response(resp) => {
-                let () = handle_resp(
-                    &mut enforcer,
-                    &mempool,
-                    &mut sync_state,
-                    resp?,
-                )
-                .await?;
+                let () = handle_resp(&inner, &mut sync_state, resp?).await?;
             }
         }
     }
 }
 
-pub struct MempoolSync {
-    mempool: Arc<RwLock<Mempool>>,
+pub struct MempoolSync<Enforcer> {
+    inner: Arc<RwLock<MempoolSyncInner<Enforcer>>>,
     task: JoinHandle<()>,
 }
 
-impl MempoolSync {
-    pub fn new<Enforcer>(
+impl<Enforcer> MempoolSync<Enforcer>
+where
+    Enforcer: CusfEnforcer + Send + Sync + 'static,
+{
+    pub fn new(
         enforcer: Enforcer,
         mempool: Mempool,
         tx_cache: HashMap<Txid, Transaction>,
         rpc_client: &HttpClient,
         sequence_stream: SequenceStream<'static>,
-    ) -> Self
-    where
-        Enforcer: CusfEnforcer + Send + 'static,
-    {
-        let mempool = Arc::new(RwLock::new(mempool));
+    ) -> Self {
+        let inner = MempoolSyncInner { enforcer, mempool };
+        let inner = Arc::new(RwLock::new(inner));
         let task = spawn(
-            task(
-                enforcer,
-                mempool.clone(),
-                tx_cache,
-                rpc_client.clone(),
-                sequence_stream,
-            )
-            .unwrap_or_else(|err| {
-                let err = anyhow::Error::from(err);
-                tracing::error!("{err:#}");
-            }),
+            task(inner.clone(), tx_cache, rpc_client.clone(), sequence_stream)
+                .unwrap_or_else(|err| {
+                    let err = anyhow::Error::from(err);
+                    tracing::error!("{err:#}");
+                }),
         );
-        Self { mempool, task }
+        Self { inner, task }
     }
 
-    pub async fn with_mempool<F, Output>(&self, f: F) -> Output
+    pub async fn with<F, Output>(&self, f: F) -> Output
     where
-        F: FnOnce(&Mempool) -> Output,
+        F: FnOnce(&Mempool, &Enforcer) -> Output,
     {
-        let mempool_read = self.mempool.read().await;
-        f(&mempool_read)
+        let inner_read = self.inner.read().await;
+        f(&inner_read.mempool, &inner_read.enforcer)
     }
 }
 
-impl Drop for MempoolSync {
+impl<Enforcer> Drop for MempoolSync<Enforcer> {
     fn drop(&mut self) {
         self.task.abort()
     }

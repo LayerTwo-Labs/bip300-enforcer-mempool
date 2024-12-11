@@ -6,7 +6,8 @@ use std::{
 
 use bip300301::{
     client::{
-        GetRawTransactionClient as _, GetRawTransactionVerbose, MainClient as _,
+        GetBlockClient as _, GetRawTransactionClient as _,
+        GetRawTransactionVerbose, MainClient as _, U8Witness,
     },
     jsonrpsee::{
         core::{
@@ -224,7 +225,8 @@ async fn batched_request(
             Ok(BatchedResponseItem::BatchTx(txs))
         }
         BatchedRequestItem::Single(RequestItem::Block(block_hash)) => {
-            let block = rpc_client.getblock(block_hash, Some(1)).await?;
+            let block =
+                rpc_client.get_block(block_hash, U8Witness::<1>).await?;
             let resp = ResponseItem::Block(Box::new(block));
             Ok(BatchedResponseItem::Single(resp))
         }

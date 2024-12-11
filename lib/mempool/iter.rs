@@ -16,7 +16,7 @@ pub struct Ancestors<'mempool_txs> {
     visited: HashSet<Txid>,
 }
 
-impl<'mempool_txs> Ancestors<'mempool_txs> {
+impl Ancestors<'_> {
     fn next(
         &mut self,
     ) -> Result<Option<AncestorsItem<'_>>, MissingAncestorError> {

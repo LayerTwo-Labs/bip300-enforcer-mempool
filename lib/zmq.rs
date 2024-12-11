@@ -1,4 +1,7 @@
+use std::ops::Add;
+
 use bitcoin::{hashes::Hash as _, BlockHash, Txid};
+use either::Either;
 use futures::{
     stream::{self, BoxStream},
     Stream, StreamExt, TryStreamExt as _,
@@ -7,39 +10,54 @@ use thiserror::Error;
 use zeromq::{Socket as _, SocketRecv as _, ZmqError, ZmqMessage};
 
 #[derive(Clone, Copy, Debug)]
-pub enum SequenceMessage {
-    BlockHashConnected(BlockHash, u32),
-    BlockHashDisconnected(BlockHash, u32),
+pub enum BlockHashEvent {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BlockHashMessage {
+    pub block_hash: BlockHash,
+    pub event: BlockHashEvent,
+    pub zmq_seq: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TxHashEvent {
     /// Tx hash added to mempool
-    TxHashAdded {
-        txid: Txid,
-        mempool_seq: u64,
-        zmq_seq: u32,
-    },
+    Added,
     /// Tx hash removed from mempool for non-block inclusion reason
-    TxHashRemoved {
-        txid: Txid,
-        mempool_seq: u64,
-        zmq_seq: u32,
-    },
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TxHashMessage {
+    pub txid: Txid,
+    pub event: TxHashEvent,
+    pub mempool_seq: u64,
+    pub zmq_seq: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SequenceMessage {
+    BlockHash(BlockHashMessage),
+    TxHash(TxHashMessage),
 }
 
 impl SequenceMessage {
     fn mempool_seq(&self) -> Option<u64> {
         match self {
-            Self::TxHashAdded { mempool_seq, .. }
-            | Self::TxHashRemoved { mempool_seq, .. } => Some(*mempool_seq),
-            Self::BlockHashConnected(_, _)
-            | Self::BlockHashDisconnected(_, _) => None,
+            Self::BlockHash { .. } => None,
+            Self::TxHash(TxHashMessage { mempool_seq, .. }) => {
+                Some(*mempool_seq)
+            }
         }
     }
 
     fn zmq_seq(&self) -> u32 {
         match self {
-            Self::TxHashAdded { zmq_seq, .. }
-            | Self::TxHashRemoved { zmq_seq, .. }
-            | Self::BlockHashConnected(_, zmq_seq)
-            | Self::BlockHashDisconnected(_, zmq_seq) => *zmq_seq,
+            Self::BlockHash(BlockHashMessage { zmq_seq, .. })
+            | Self::TxHash(TxHashMessage { zmq_seq, .. }) => *zmq_seq,
         }
     }
 }
@@ -85,35 +103,39 @@ impl TryFrom<ZmqMessage> for SequenceMessage {
         };
         let zmq_seq = u32::from_le_bytes(*zmq_seq);
         let res = match *message_type {
-            b'C' => Self::BlockHashConnected(
-                BlockHash::from_byte_array(hash),
+            b'C' => Self::BlockHash(BlockHashMessage {
+                block_hash: BlockHash::from_byte_array(hash),
+                event: BlockHashEvent::Connected,
                 zmq_seq,
-            ),
-            b'D' => Self::BlockHashDisconnected(
-                BlockHash::from_byte_array(hash),
+            }),
+            b'D' => Self::BlockHash(BlockHashMessage {
+                block_hash: BlockHash::from_byte_array(hash),
+                event: BlockHashEvent::Disconnected,
                 zmq_seq,
-            ),
+            }),
             b'A' => {
                 let Some((mempool_seq, _rest)) = rest.split_first_chunk()
                 else {
                     return Err(Self::Error::MissingMempoolSequence);
                 };
-                Self::TxHashAdded {
+                Self::TxHash(TxHashMessage {
                     txid: Txid::from_byte_array(hash),
+                    event: TxHashEvent::Added,
                     mempool_seq: u64::from_le_bytes(*mempool_seq),
                     zmq_seq,
-                }
+                })
             }
             b'R' => {
                 let Some((mempool_seq, _rest)) = rest.split_first_chunk()
                 else {
                     return Err(Self::Error::MissingMempoolSequence);
                 };
-                SequenceMessage::TxHashRemoved {
+                SequenceMessage::TxHash(TxHashMessage {
                     txid: Txid::from_byte_array(hash),
+                    event: TxHashEvent::Removed,
                     mempool_seq: u64::from_le_bytes(*mempool_seq),
                     zmq_seq,
-                }
+                })
             }
             message_type => {
                 return Err(Self::Error::UnknownMessageType(message_type))
@@ -139,7 +161,7 @@ pub struct SequenceStream<'a>(
     BoxStream<'a, Result<SequenceMessage, SequenceStreamError>>,
 );
 
-impl<'a> Stream for SequenceStream<'a> {
+impl Stream for SequenceStream<'_> {
     type Item = Result<SequenceMessage, SequenceStreamError>;
 
     fn poll_next(
@@ -154,13 +176,88 @@ impl<'a> Stream for SequenceStream<'a> {
     }
 }
 
+/// Returns `Left(true)` if the sequence number is equal to the next sequence
+/// number, and increments the next sequence number.
+/// Returns `Left(true)` if the next sequence number is `None`, and sets the
+/// next sequence number to the successor of the sequence number.
+/// Returns `Left(false)` if the next sequence number is `1` greater than the
+/// sequence number (ignore duplicate messages).
+/// Otherwise, returns `Right(next_seq)`.
+fn check_seq_number<Seq>(
+    next_seq: &mut Option<Seq>,
+    seq: Seq,
+) -> Either<bool, &mut Seq>
+where
+    Seq: Add<Seq, Output = Seq> + Copy + Eq + num_traits::ConstOne,
+{
+    match next_seq {
+        None => {
+            *next_seq = Some(seq + Seq::ONE);
+            Either::Left(true)
+        }
+        Some(next_seq) => {
+            if seq + Seq::ONE == *next_seq {
+                // Ignore duplicates
+                Either::Left(false)
+            } else if seq == *next_seq {
+                *next_seq = seq + Seq::ONE;
+                Either::Left(true)
+            } else {
+                Either::Right(next_seq)
+            }
+        }
+    }
+}
+
+/// See [`check_seq_number`]
+fn check_mempool_seq(
+    next_mempool_seq: &mut Option<u64>,
+    msg: SequenceMessage,
+) -> Result<Option<SequenceMessage>, SequenceStreamError> {
+    let Some(mempool_seq) = msg.mempool_seq() else {
+        return Ok(Some(msg));
+    };
+    match check_seq_number(next_mempool_seq, mempool_seq) {
+        Either::Left(true) => Ok(Some(msg)),
+        Either::Left(false) => Ok(None),
+        Either::Right(next_mempool_seq) => Err(
+            SequenceStreamError::MissingMempoolSequence(*next_mempool_seq),
+        ),
+    }
+}
+
+/// See [`check_seq_number`]
+fn check_zmq_seq(
+    next_zmq_seq: &mut Option<u32>,
+    msg: SequenceMessage,
+) -> Result<Option<SequenceMessage>, SequenceStreamError> {
+    match check_seq_number(next_zmq_seq, msg.zmq_seq()) {
+        Either::Left(true) => Ok(Some(msg)),
+        Either::Left(false) => Ok(None),
+        Either::Right(next_zmq_seq) => {
+            Err(SequenceStreamError::MissingZmqSequence(*next_zmq_seq))
+        }
+    }
+}
+
+fn check_seq_numbers(
+    next_mempool_seq: &mut Option<u64>,
+    next_zmq_seq: &mut Option<u32>,
+    msg: SequenceMessage,
+) -> Result<Option<SequenceMessage>, SequenceStreamError> {
+    let Some(msg) = check_mempool_seq(next_mempool_seq, msg)? else {
+        return Ok(None);
+    };
+    check_zmq_seq(next_zmq_seq, msg)
+}
+
 #[tracing::instrument]
 pub async fn subscribe_sequence<'a>(
-    zmq_addr_rawblock: &str,
+    zmq_addr_sequence: &str,
 ) -> Result<SequenceStream<'a>, ZmqError> {
     tracing::debug!("Attempting to connect to ZMQ server...");
     let mut socket = zeromq::SubSocket::new();
-    socket.connect(zmq_addr_rawblock).await?;
+    socket.connect(zmq_addr_sequence).await?;
     tracing::info!("Connected to ZMQ server");
     tracing::debug!("Attempting to subscribe to `sequence` topic...");
     socket.subscribe("sequence").await?;
@@ -173,68 +270,12 @@ pub async fn subscribe_sequence<'a>(
         let mut next_mempool_seq: Option<u64> = None;
         let mut next_zmq_seq: Option<u32> = None;
         move |sequence_msg| {
-            let (mempool_seq, zmq_seq) = match sequence_msg {
-                SequenceMessage::BlockHashConnected(_, zmq_seq)
-                | SequenceMessage::BlockHashDisconnected(_, zmq_seq) => {
-                    next_mempool_seq = None;
-                    (None, zmq_seq)
-                }
-                SequenceMessage::TxHashAdded {
-                    txid: _,
-                    mempool_seq,
-                    zmq_seq,
-                }
-                | SequenceMessage::TxHashRemoved {
-                    txid: _,
-                    mempool_seq,
-                    zmq_seq,
-                } => (Some(mempool_seq), zmq_seq),
-            };
-            let res = 'res: {
-                match &mut next_zmq_seq {
-                    None => {
-                        next_zmq_seq = Some(zmq_seq + 1);
-                    }
-                    Some(next_zmq_seq) => {
-                        if zmq_seq + 1 == *next_zmq_seq {
-                            // Ignore duplicates
-                            break 'res Ok(None);
-                        } else if zmq_seq != *next_zmq_seq {
-                            break 'res Err(
-                                SequenceStreamError::MissingZmqSequence(
-                                    *next_zmq_seq,
-                                ),
-                            );
-                        } else {
-                            *next_zmq_seq = zmq_seq + 1;
-                        }
-                    }
-                }
-                let Some(mempool_seq) = mempool_seq else {
-                    break 'res Ok(Some(sequence_msg));
-                };
-                match &mut next_mempool_seq {
-                    None => {
-                        next_mempool_seq = Some(mempool_seq + 1);
-                    }
-                    Some(next_mempool_seq) => {
-                        if mempool_seq + 1 == *next_mempool_seq {
-                            // Ignore duplicates
-                            break 'res Ok(None);
-                        } else if mempool_seq != *next_mempool_seq {
-                            break 'res Err(
-                                SequenceStreamError::MissingMempoolSequence(
-                                    *next_mempool_seq,
-                                ),
-                            );
-                        } else {
-                            *next_mempool_seq = mempool_seq + 1;
-                        }
-                    }
-                }
-                Ok(Some(sequence_msg))
-            };
-            async { res }
+            let res = check_seq_numbers(
+                &mut next_mempool_seq,
+                &mut next_zmq_seq,
+                sequence_msg,
+            );
+            futures::future::ready(res)
         }
     })
     .boxed();

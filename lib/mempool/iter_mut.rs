@@ -16,7 +16,7 @@ pub struct AncestorsMut<'mempool_txs> {
     visited: HashSet<Txid>,
 }
 
-impl<'mempool_txs> AncestorsMut<'mempool_txs> {
+impl AncestorsMut<'_> {
     fn next(
         &mut self,
     ) -> Result<Option<AncestorsItem<'_>>, MissingAncestorError> {
@@ -85,7 +85,7 @@ pub struct DescendantsMut<'mempool_txs> {
     visited: HashSet<Txid>,
 }
 
-impl<'mempool_txs> DescendantsMut<'mempool_txs> {
+impl DescendantsMut<'_> {
     fn next(
         &mut self,
     ) -> Result<Option<DescendantsItem<'_>>, MissingDescendantError> {
