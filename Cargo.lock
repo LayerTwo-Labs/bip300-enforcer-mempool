@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "bip300301"
 version = "0.1.1"
-source = "git+https://github.com/Ash-L2L/bip300301.git?rev=1d6b5da3d346b13b49e42cdd7d91b86758e3b6d9#1d6b5da3d346b13b49e42cdd7d91b86758e3b6d9"
+source = "git+https://github.com/Ash-L2L/bip300301.git?rev=2315ddde381af907fcf8e029046bd5c43448a71f#2315ddde381af907fcf8e029046bd5c43448a71f"
 dependencies = [
  "base64 0.21.7",
  "bitcoin",
