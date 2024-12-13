@@ -1,6 +1,10 @@
 use std::net::SocketAddr;
 
-use bip300301::{jsonrpsee::http_client::HttpClientBuilder, MainClient as _};
+use bip300301::{
+    client::BlockTemplateRequest, jsonrpsee::http_client::HttpClientBuilder,
+    MainClient as _,
+};
+use bitcoin::Network;
 use clap::Parser;
 use jsonrpsee::server::ServerHandle;
 use tokio::time::Duration;
@@ -33,6 +37,8 @@ async fn spawn_rpc_server(
     server: server::Server<DefaultEnforcer>,
     serve_rpc_addr: SocketAddr,
 ) -> anyhow::Result<ServerHandle> {
+    tracing::info!("serving RPC on {}", serve_rpc_addr);
+
     use server::RpcServer;
     let handle = jsonrpsee::server::Server::builder()
         .build(serve_rpc_addr)
@@ -68,8 +74,30 @@ async fn main() -> anyhow::Result<()> {
         tracing::debug!("connected to RPC server");
         (client, network_info)
     };
-    let sample_block_template =
-        rpc_client.get_block_template(Default::default()).await?;
+
+    let blockchain_info = rpc_client.get_blockchain_info().await?;
+
+    let request = if blockchain_info.chain == Network::Signet {
+        let default_request = BlockTemplateRequest::default();
+        let mut rules = default_request.rules;
+
+        // Important: signet rules must be present on signet.
+        rules.push("signet".to_string());
+
+        BlockTemplateRequest {
+            rules,
+            ..default_request
+        }
+    } else {
+        BlockTemplateRequest::default()
+    };
+    let sample_block_template = rpc_client
+        .get_block_template(request)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to get sample block template: {err:#}")
+        })?;
+
     let mut sequence_stream =
         zmq::subscribe_sequence(&cli.node_zmq_addr_sequence).await?;
     let (mempool, tx_cache) = {

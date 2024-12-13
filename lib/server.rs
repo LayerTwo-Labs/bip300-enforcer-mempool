@@ -174,6 +174,10 @@ where
         );
         let height = tip_block_height as u32 + 1;
         let res = BlockTemplate {
+            signet_challenge: self
+                .sample_block_template
+                .signet_challenge
+                .clone(),
             version,
             rules: rules.clone(),
             version_bits_available: version_bits_available.clone(),
